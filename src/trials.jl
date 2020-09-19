@@ -1,8 +1,8 @@
 #########
 # Trial #
 #########
-
-mutable struct Trial
+abstract type AbstractTrial end
+mutable struct Trial <: AbstractTrial
     params::Parameters
     times::Vector{Float64}
     gctimes::Vector{Float64}
@@ -10,7 +10,17 @@ mutable struct Trial
     allocs::Int
 end
 
+mutable struct MyTrial <: AbstractTrial
+    params::Parameters
+    times::Vector{Float64}
+    gctimes::Vector{Float64}
+    memory::Int
+    allocs::Int
+    mymetric::Vector{Any}
+end
+
 Trial(params::Parameters) = Trial(params, Float64[], Float64[], typemax(Int), typemax(Int))
+MyTrial(params::Parameters) = MyTrial(params, Float64[], Float64[], typemax(Int), typemax(Int), [])
 
 function Base.:(==)(a::Trial, b::Trial)
     return a.params == b.params &&
@@ -30,31 +40,52 @@ function Base.push!(t::Trial, time, gctime, memory, allocs)
     return t
 end
 
+function Base.push!(t::MyTrial, time, gctime, memory, allocs, mymetric)
+    push!(t.times, time)
+    push!(t.gctimes, gctime)
+    memory < t.memory && (t.memory = memory)
+    allocs < t.allocs && (t.allocs = allocs)
+    push!(t.mymetric, mymetric)
+    return t
+end
+
+
 function Base.deleteat!(t::Trial, i)
     deleteat!(t.times, i)
     deleteat!(t.gctimes, i)
     return t
 end
 
-Base.length(t::Trial) = length(t.times)
+Base.length(t::AbstractTrial) = length(t.times)
+
 Base.getindex(t::Trial, i::Number) = push!(Trial(t.params), t.times[i], t.gctimes[i], t.memory, t.allocs)
 Base.getindex(t::Trial, i) = Trial(t.params, t.times[i], t.gctimes[i], t.memory, t.allocs)
 Base.lastindex(t::Trial) = length(t)
 
-function Base.sort!(t::Trial)
+function Base.sort!(t::AbstractTrial)
     inds = sortperm(t.times)
     t.times = t.times[inds]
     t.gctimes = t.gctimes[inds]
     return t
 end
+function Base.sort!(t::MyTrial)
+    inds = sortperm(t.mymetric)
+    t.times = t.times[inds]
+    t.gctimes = t.gctimes[inds]
+    t.mymetric = t.mymetric[inds]
+    return t
+end
 
-Base.sort(t::Trial) = sort!(copy(t))
+Base.sort(t::AbstractTrial) = sort!(copy(t))
 
-Base.time(t::Trial) = time(minimum(t))
-gctime(t::Trial) = gctime(minimum(t))
-memory(t::Trial) = t.memory
-allocs(t::Trial) = t.allocs
-params(t::Trial) = t.params
+
+Base.time(t::AbstractTrial) = time(minimum(t))
+gctime(t::AbstractTrial) = gctime(minimum(t))
+memory(t::AbstractTrial) = t.memory
+allocs(t::AbstractTrial) = t.allocs
+params(t::AbstractTrial) = t.params
+mymetric(t::AbstractTrial) = Inf
+mymetric(t::MyTrial) = minimum(t.mymetric)
 
 # returns the index of the first outlier in `values`, if any outliers are detected.
 # `values` is assumed to be sorted from least to greatest, and assumed to be right-skewed.
@@ -66,21 +97,21 @@ function skewcutoff(values)
     return length(current_values) + 1
 end
 
-skewcutoff(t::Trial) = skewcutoff(t.times)
+skewcutoff(t::AbstractTrial) = skewcutoff(t.times)
 
-function rmskew!(t::Trial)
+function rmskew!(t::AbstractTrial)
     sort!(t)
     i = skewcutoff(t)
     i <= length(t) && deleteat!(t, i:length(t))
     return t
 end
 
-function rmskew(t::Trial)
+function rmskew(t::AbstractTrial)
     st = sort(t)
     return st[1:(skewcutoff(st) - 1)]
 end
 
-trim(t::Trial, percentage = 0.1) = t[1:max(1, floor(Int, length(t) - (length(t) * percentage)))]
+trim(t::AbstractTrial, percentage = 0.1) = t[1:max(1, floor(Int, length(t) - (length(t) * percentage)))]
 
 #################
 # TrialEstimate #
@@ -92,10 +123,11 @@ mutable struct TrialEstimate
     gctime::Float64
     memory::Int
     allocs::Int
+    mymetric::Float64
 end
 
-function TrialEstimate(trial::Trial, t, gct)
-    return TrialEstimate(params(trial), t, gct, memory(trial), allocs(trial))
+function TrialEstimate(trial::AbstractTrial, t, gct, mymetric)
+    return TrialEstimate(params(trial), t, gct, memory(trial), allocs(trial), mymetric)
 end
 
 function Base.:(==)(a::TrialEstimate, b::TrialEstimate)
@@ -103,23 +135,36 @@ function Base.:(==)(a::TrialEstimate, b::TrialEstimate)
            a.time == b.time &&
            a.gctime == b.gctime &&
            a.memory == b.memory &&
-           a.allocs == b.allocs
+           a.allocs == b.allocs &&
+           a.mymetric == b.mymetric
 end
 
-Base.copy(t::TrialEstimate) = TrialEstimate(copy(t.params), t.time, t.gctime, t.memory, t.allocs)
+Base.copy(t::TrialEstimate) = TrialEstimate(copy(t.params), t.time, t.gctime, t.memory, t.allocs, t.mymetric)
 
-function Base.minimum(trial::Trial)
+function Base.minimum(trial::AbstractTrial)
     i = argmin(trial.times)
     return TrialEstimate(trial, trial.times[i], trial.gctimes[i])
 end
+function Base.minimum(trial::MyTrial)
+    i = argmin(trial.mymetric)
+    return TrialEstimate(trial, trial.times[i], trial.gctimes[i], trial.mymetric[i])
+end
 
-function Base.maximum(trial::Trial)
+
+function Base.maximum(trial::AbstractTrial)
     i = argmax(trial.times)
     return TrialEstimate(trial, trial.times[i], trial.gctimes[i])
 end
 
-Statistics.median(trial::Trial) = TrialEstimate(trial, median(trial.times), median(trial.gctimes))
-Statistics.mean(trial::Trial) = TrialEstimate(trial, mean(trial.times), mean(trial.gctimes))
+function Base.maximum(trial::MyTrial)
+    i = argmax(trial.mymetric)
+    return TrialEstimate(trial, trial.times[i], trial.gctimes[i], trial.mymetric[i])
+end
+
+Statistics.median(trial::Trial) = TrialEstimate(trial, median(trial.times), median(trial.gctimes), Inf)
+Statistics.mean(trial::Trial) = TrialEstimate(trial, mean(trial.times), mean(trial.gctimes), Inf)
+Statistics.median(trial::MyTrial) = TrialEstimate(trial, median(trial.times), median(trial.gctimes), median(trial.mymetric))
+Statistics.mean(trial::MyTrial) = TrialEstimate(trial, mean(trial.times), mean(trial.gctimes), median(trial.mymetric))
 
 Base.isless(a::TrialEstimate, b::TrialEstimate) = isless(time(a), time(b))
 
@@ -128,6 +173,7 @@ gctime(t::TrialEstimate) = t.gctime
 memory(t::TrialEstimate) = t.memory
 allocs(t::TrialEstimate) = t.allocs
 params(t::TrialEstimate) = t.params
+mymetric(t::TrialEstimate) = t.mymetric
 
 ##############
 # TrialRatio #
@@ -139,6 +185,7 @@ mutable struct TrialRatio
     gctime::Float64
     memory::Float64
     allocs::Float64
+    mymetric::Float64
 end
 
 function Base.:(==)(a::TrialRatio, b::TrialRatio)
@@ -146,16 +193,18 @@ function Base.:(==)(a::TrialRatio, b::TrialRatio)
            a.time == b.time &&
            a.gctime == b.gctime &&
            a.memory == b.memory &&
-           a.allocs == b.allocs
+           a.allocs == b.allocs &&
+           a.mymetric == b.mymetric
 end
 
-Base.copy(t::TrialRatio) = TrialRatio(copy(t.params), t.time, t.gctime, t.memory, t.allocs)
+Base.copy(t::TrialRatio) = TrialRatio(copy(t.params), t.time, t.gctime, t.memory, t.allocs, t.mymetric)
 
 Base.time(t::TrialRatio) = t.time
 gctime(t::TrialRatio) = t.gctime
 memory(t::TrialRatio) = t.memory
 allocs(t::TrialRatio) = t.allocs
 params(t::TrialRatio) = t.params
+mymetric(t::TrialRatio) = t.mymetric
 
 function ratio(a::Real, b::Real)
     if a == b # so that ratio(0.0, 0.0) returns 1.0
@@ -169,7 +218,8 @@ function ratio(a::TrialEstimate, b::TrialEstimate)
     mtol = max(params(a).memory_tolerance, params(b).memory_tolerance)
     p = Parameters(params(a); time_tolerance = ttol, memory_tolerance = mtol)
     return TrialRatio(p, ratio(time(a), time(b)), ratio(gctime(a), gctime(b)),
-                      ratio(memory(a), memory(b)), ratio(allocs(a), allocs(b)))
+                      ratio(memory(a), memory(b)), ratio(allocs(a), allocs(b)),
+                      ratio(mymetric(a), mymetric(b)))
 end
 
 gcratio(t::TrialEstimate) =  ratio(gctime(t), time(t))
@@ -182,12 +232,13 @@ struct TrialJudgement
     ratio::TrialRatio
     time::Symbol
     memory::Symbol
+    mymetric::Symbol
 end
 
 function TrialJudgement(r::TrialRatio)
     ttol = params(r).time_tolerance
     mtol = params(r).memory_tolerance
-    return TrialJudgement(r, judge(time(r), ttol), judge(memory(r), mtol))
+    return TrialJudgement(r, judge(time(r), ttol), judge(memory(r), mtol), judge(mymetric(r), 0.0))
 end
 
 function Base.:(==)(a::TrialJudgement, b::TrialJudgement)
@@ -340,6 +391,40 @@ function Base.show(io::IO, ::MIME"text/plain", t::Trial)
     println(io, pad, "  median time:      ", medstr)
     println(io, pad, "  mean time:        ", meanstr)
     println(io, pad, "  maximum time:     ", maxstr)
+    println(io, pad, "  --------------")
+    println(io, pad, "  samples:          ", length(t))
+    print(io,   pad, "  evals/sample:     ", t.params.evals)
+end
+
+function Base.show(io::IO, ::MIME"text/plain", t::MyTrial)
+    if length(t) > 0
+        min = minimum(t)
+        max = maximum(t)
+        med = median(t)
+        avg = mean(t)
+        memorystr = string(prettymemory(memory(min)))
+        allocsstr = string(allocs(min))
+        minstr = string(mymetric(min), " \t[", prettytime(time(min)), " (", prettypercent(gcratio(min)), " GC)]")
+        maxstr = string(mymetric(max), " \t[", prettytime(time(max)), " (", prettypercent(gcratio(max)), " GC)]")
+        medstr = string(mymetric(med), " \t[", prettytime(time(med)), " (", prettypercent(gcratio(med)), " GC)]")
+        meanstr = string(mymetric(avg), " \t[", prettytime(time(avg)), " (", prettypercent(gcratio(avg)), " GC)]")
+    else
+        memorystr = "N/A"
+        allocsstr = "N/A"
+        minstr = "N/A"
+        maxstr = "N/A"
+        medstr = "N/A"
+        meanstr = "N/A"
+    end
+    println(io, "BenchmarkTools.MyTrial: ")
+    pad = get(io, :pad, "")
+    println(io, pad, "  memory estimate:  ", memorystr)
+    println(io, pad, "  allocs estimate:  ", allocsstr)
+    println(io, pad, "  --------------")
+    println(io, pad, "  minimum mymetric:     ", minstr)
+    println(io, pad, "  median mymetric:      ", medstr)
+    println(io, pad, "  mean mymetric:        ", meanstr)
+    println(io, pad, "  maximum mymetric:     ", maxstr)
     println(io, pad, "  --------------")
     println(io, pad, "  samples:          ", length(t))
     print(io,   pad, "  evals/sample:     ", t.params.evals)

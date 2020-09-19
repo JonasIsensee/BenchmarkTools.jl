@@ -491,3 +491,107 @@ macro btime(args...)
         $result
     end)
 end
+
+
+
+macro mybenchmark(args...)
+    _, params = prunekwargs(args...)
+    tmp = gensym()
+    return esc(quote
+        local $tmp = $BenchmarkTools.@mybenchmarkable $(args...)
+        $BenchmarkTools.warmup($tmp)
+        $(hasevals(params) ? :() : :($BenchmarkTools.tune!($tmp)))
+        $BenchmarkTools.run($tmp)
+    end)
+end
+
+macro mybenchmarkable(args...)
+    core, setup, teardown, params = benchmarkable_parts(args)
+
+    # extract any variable bindings shared between the core and setup expressions
+    setup_vars = isa(setup, Expr) ? collectvars(setup) : []
+    core_vars = isa(core, Expr) ? collectvars(core) : []
+    out_vars = filter(var -> var in setup_vars, core_vars)
+
+    # generate the benchmark definition
+    return esc(quote
+        $BenchmarkTools.generate_mybenchmark_definition($__module__,
+                                                      $(Expr(:quote, out_vars)),
+                                                      $(Expr(:quote, setup_vars)),
+                                                      $(Expr(:quote, core)),
+                                                      $(Expr(:quote, setup)),
+                                                      $(Expr(:quote, teardown)),
+                                                      $Parameters($(params...)))
+    end)
+end
+
+function generate_mybenchmark_definition(eval_module, out_vars, setup_vars, core, setup, teardown, params)
+    id = Expr(:quote, gensym("benchmark"))
+    corefunc = gensym("core")
+    samplefunc = gensym("sample")
+    type_vars = [gensym() for i in 1:length(setup_vars)]
+    signature = Expr(:call, corefunc, setup_vars...)
+    signature_def = Expr(:where, Expr(:call, corefunc,
+                                  [Expr(:(::), setup_var, type_var) for (setup_var, type_var) in zip(setup_vars, type_vars)]...)
+                    , type_vars...)
+    if length(out_vars) == 0
+        invocation = signature
+        core_body = core
+    elseif length(out_vars) == 1
+        returns = :(return $(out_vars[1]))
+        invocation = :($(out_vars[1]) = $(signature))
+        core_body = :($(core); $(returns))
+    else
+        returns = :(return $(Expr(:tuple, out_vars...)))
+        invocation = :($(Expr(:tuple, out_vars...)) = $(signature))
+        core_body = :($(core); $(returns))
+    end
+    return Core.eval(eval_module, quote
+        @noinline $(signature_def) = begin $(core_body) end
+        @noinline function $(samplefunc)(__params::$BenchmarkTools.Parameters)
+            $(setup)
+            __evals = __params.evals
+            __gc_start = Base.gc_num()
+            __start_time = time_ns()
+            __return_val = $(invocation)
+            for __iter in 2:__evals
+                $(invocation)
+            end
+            __sample_time = time_ns() - __start_time
+            __gcdiff = Base.GC_Diff(Base.gc_num(), __gc_start)
+            $(teardown)
+            __time = max((__sample_time / __evals) - __params.overhead, 0.001)
+            __gctime = max((__gcdiff.total_time / __evals) - __params.overhead, 0.0)
+            __memory = Int(fld(__gcdiff.allocd, __evals))
+            __allocs = Int(fld(__gcdiff.malloc + __gcdiff.realloc +
+                               __gcdiff.poolalloc + __gcdiff.bigalloc,
+                               __evals))
+            return __time, __gctime, __memory, __allocs, __return_val
+        end
+        function $BenchmarkTools.sample(b::$BenchmarkTools.Benchmark{$(id)},
+                                        p::$BenchmarkTools.Parameters = b.params)
+            return $(samplefunc)(p)
+        end
+        function $BenchmarkTools._run(b::$BenchmarkTools.Benchmark{$(id)},
+                                      p::$BenchmarkTools.Parameters;
+                                      verbose = false, pad = "", kwargs...)
+            params = $BenchmarkTools.Parameters(p; kwargs...)
+            @assert params.seconds > 0.0 "time limit must be greater than 0.0"
+            params.gctrial && $BenchmarkTools.gcscrub()
+            start_time = Base.time()
+            trial = $BenchmarkTools.MyTrial(params)
+            params.gcsample && $BenchmarkTools.gcscrub()
+            s = $(samplefunc)(params)
+            push!(trial, s...)
+            return_val = s[end]
+            iters = 2
+            while (Base.time() - start_time) < params.seconds && iters ≤ params.samples
+                 params.gcsample && $BenchmarkTools.gcscrub()
+                 push!(trial, $(samplefunc)(params)...)
+                 iters += 1
+            end
+            return sort!(trial), return_val
+        end
+        $BenchmarkTools.Benchmark{$(id)}($(params))
+    end)
+end
